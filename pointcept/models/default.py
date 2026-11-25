@@ -51,13 +51,12 @@ class DefaultSegmentorV2(nn.Module):
         level_loss_enabled=True,
         level_channels=None,
         level_loss_weights=None,
-        # Multi-pass training tiers derived geometrically: tiers = [n0 * n0_scale**i for i in range(num_passes)].
-        # loss_weights gives one weight per tier (length must equal num_passes). num_passes <= 1 disables multi-pass.
+        # multi-pass tiers: n0 * n0_scale**i for i < num_passes, one loss weight each
         n0=None,
         n0_scale=4,
         num_passes=1,
         loss_weights=None,
-        # "adaptive" picks n0 from the derived tier list; dict {"n0": int} forces a fixed n0; None disables.
+        # "adaptive" (largest tier <= N), dict(n0=int), or None
         eval_pass=None,
         bottleneck_consistency_weight=0.0,
     ):
@@ -203,7 +202,7 @@ class DefaultSegmentorV2(nn.Module):
 
                 _, seg_logits, out_point = self._run_backbone_and_head(sub_point)
 
-                # Backbone subsample marks uncovered points so they don't contribute to the loss.
+                # points not covered by this pass are ignored in the loss
                 segment = input_dict["segment"].clone()
                 if "points_masked" in out_point.keys() and out_point.points_masked is not None:
                     segment[out_point.points_masked] = self.ignore_index
@@ -252,7 +251,7 @@ class DefaultSegmentorV2(nn.Module):
         if not self.training:
             if self.eval_pass == "adaptive":
                 N = point.feat.shape[0]
-                # Floor to largest tier <= N, fallback to smallest tier.
+                # largest tier <= N, else the smallest tier
                 n0_tiers = sorted(self.eval_n0_tiers)
                 point["n0"] = n0_tiers[0]
                 for t in n0_tiers:

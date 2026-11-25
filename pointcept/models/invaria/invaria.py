@@ -88,9 +88,9 @@ class PredictorAttn(nn.Module):
         return out
 
 
-@MODELS.register_module("Invaria-v3")
-class InvariaV3(nn.Module):
-    """PTv3 with kNN predictor: input → sample n0 → backbone → interpolate to input."""
+@MODELS.register_module("Invaria")
+class Invaria(nn.Module):
+    """Sample n0 points, run the PTv3 backbone, predict features back on all input points."""
 
     def __init__(
         self,
@@ -147,9 +147,7 @@ class InvariaV3(nn.Module):
         assert num_stages == len(enc_channels)
         assert len(dec_depths) == num_stages - 1
 
-        # Configurable norms: `other_norm` for conv/pool/unpool/predictor_nn,
-        # `attn_norm` for PTv3 attention blocks and the kNN attention predictor.
-        # Defaults follow the PTv3 recipe (BN for conv stages, LN inside attention).
+        # other_norm: conv/pool/unpool; attn_norm: attention blocks and predictor
         bn_layer = _make_norm_factory(other_norm)
         ln_layer = _make_norm_factory(attn_norm)
         act_layer = nn.GELU
@@ -296,7 +294,7 @@ class InvariaV3(nn.Module):
 
     @staticmethod
     def _curve_neighbors(target_coord, target_batch, source_coord, source_batch, B, k=3):
-        """k curve-nearest source indices per target via Morton-curve searchsorted ± neighbors."""
+        """Indices of the k source points nearest to each target along a Morton curve."""
         device = target_coord.device
         N = target_coord.shape[0]
         half = (k - 1) // 2
@@ -468,7 +466,7 @@ class InvariaV3(nn.Module):
                     grid_size_s0 = self._reduce_nn_dists(d_s0.min(dim=1).values).item() * self.grid_size_scale
                 else:
                     grid_size_s0 = float("nan")
-            print(f"[InvariaV3 scene0] n0={n0}, n_full={n_full_s0}, n_points={n_points_s0}, grid_size={grid_size_s0:.6f}")
+            print(f"[Invaria scene0] n0={n0}, n_full={n_full_s0}, n_points={n_points_s0}, grid_size={grid_size_s0:.6f}")
         sub_point["grid_size"] = grid_size
 
         sub_point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
@@ -521,7 +519,7 @@ class InvariaV3(nn.Module):
             target_feat = (neighbor_feat * w.unsqueeze(-1)).sum(dim=1)
 
             with torch.no_grad():
-                # Sample within scene 0 only — avoids cross-scene NN contamination.
+                # estimate spacing within scene 0 only
                 scene_mask = (target_batch == 0)
                 scene_coord = target_coord[scene_mask]
                 n_sample = min(self.grid_size_samples, scene_coord.shape[0])

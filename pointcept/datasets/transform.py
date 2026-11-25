@@ -1506,24 +1506,10 @@ class ImgAugmentation(object):
 
 @TRANSFORMS.register_module()
 class OctreeMaskPoints(object):
-    """
-    Octree-based multi-level point masking as data augmentation.
+    """Cascaded octree-node masking; points in masked nodes are dropped.
 
-    Builds a lightweight octree from grid coordinates and applies cascading
-    masking at specified levels. Points belonging to masked nodes are removed.
-
-    This transform should be applied AFTER GridSample (which provides grid_coord)
-    and BEFORE SphereCrop.
-
-    Example config:
-        dict(type="OctreeMaskPoints",
-             mask_levels=[(1, 0.5), (2, 0.5)],  # 50% at L1, then 50% of remaining at L2
-             num_levels=5)
-
-    With mask_levels=[(1, 0.5), (2, 0.5)]:
-        - Level 1: mask 50% of nodes
-        - Level 2: mask 50% of remaining unmasked nodes
-        - Result: ~25% of points remain (0.5 * 0.5)
+    Apply after GridSample. mask_levels is a list of (level, ratio) with
+    level 0 the coarsest; each ratio applies to nodes still unmasked there.
     """
 
     def __init__(
@@ -1532,21 +1518,12 @@ class OctreeMaskPoints(object):
         num_levels=5,
         min_unmasked=1,
     ):
-        """
-        Args:
-            mask_levels: List of (level, ratio) tuples for cascading masking.
-                        Each ratio is applied to remaining unmasked nodes at that level.
-            num_levels: Number of octree levels (0=coarsest, num_levels-1=finest)
-            min_unmasked: Minimum nodes to keep unmasked per level
-        """
         self.mask_levels = mask_levels if mask_levels is not None else []
         self.num_levels = num_levels
         self.min_unmasked = min_unmasked
 
     def _xyz_to_morton(self, x, y, z):
-        """Convert xyz coordinates to Morton code (Z-order curve)."""
         def spread_bits(v):
-            # Spread bits for 16-bit values
             v = v.astype(np.uint64)
             v = (v | (v << 16)) & 0x0000FFFF0000FFFF
             v = (v | (v << 8)) & 0x00FF00FF00FF00FF
@@ -1570,152 +1547,90 @@ class OctreeMaskPoints(object):
         if N == 0:
             return data_dict
 
-        # Ensure grid_coord is positive
         grid_min = grid_coord.min(axis=0)
         grid_coord_pos = grid_coord - grid_min
 
-        # Build node assignments for each level
-        # Level 0 = coarsest (largest nodes), Level num_levels-1 = finest
         finest_level = self.num_levels - 1
-
-        # Compute scale factors: finest level = scale 1, coarser levels = higher scales
-        # level_scale[l] = 2^(finest_level - l)
         level_scales = [2 ** (finest_level - l) for l in range(self.num_levels)]
 
-        # Compute Morton codes at each level
         level_morton = []
         level_unique_nodes = []
         level_point_to_node = []
 
         for level in range(self.num_levels):
             scale = level_scales[level]
-            # Grid coordinates at this level
             grid_level = (grid_coord_pos // scale).astype(np.int32)
 
-            # Morton code for each point at this level
             morton = self._xyz_to_morton(
                 grid_level[:, 0].astype(np.uint64),
                 grid_level[:, 1].astype(np.uint64),
                 grid_level[:, 2].astype(np.uint64)
             )
 
-            # Find unique nodes
             unique_codes, inverse = np.unique(morton, return_inverse=True)
 
             level_morton.append(morton)
             level_unique_nodes.append(unique_codes)
             level_point_to_node.append(inverse)
 
-        # Initialize node masks (False = unmasked, True = masked)
+        # True = masked
         node_masks = [np.zeros(len(codes), dtype=bool) for codes in level_unique_nodes]
 
-        """# Debug: collect all output first, then print atomically
-        debug_lines = []
-        debug_lines.append(f"\n[DEBUG OctreeMaskPoints] mask_levels={self.mask_levels}")
-        debug_lines.append(f"[DEBUG] Initial state ({N} points):")
-        for level in range(self.num_levels):
-            node_size = 0.02 * level_scales[level]
-            debug_lines.append(f"  Level {level}: {len(level_unique_nodes[level])} nodes (node_size={node_size:.2f}m)")
-        """
-        # Sort mask_levels by level (coarse to fine)
         sorted_mask_levels = sorted(self.mask_levels, key=lambda x: x[0])
 
-        # Apply masking at each specified level
         for mask_level, mask_ratio in sorted_mask_levels:
             if mask_level < 0 or mask_level >= self.num_levels:
                 continue
             if mask_ratio <= 0:
                 continue
 
-            num_nodes = len(level_unique_nodes[mask_level])
             current_mask = node_masks[mask_level]
 
-            # Find unmasked nodes (candidates for masking)
             unmasked_indices = np.where(~current_mask)[0]
             num_unmasked = len(unmasked_indices)
 
             if num_unmasked <= self.min_unmasked:
                 continue
 
-            # Calculate how many to mask
             num_to_mask = int(num_unmasked * mask_ratio)
             max_maskable = num_unmasked - self.min_unmasked
             num_to_mask = min(num_to_mask, max_maskable)
             num_to_mask = max(num_to_mask, 0)
 
             if num_to_mask > 0:
-                # Randomly select nodes to mask
                 perm = np.random.permutation(num_unmasked)
                 nodes_to_mask = unmasked_indices[perm[:num_to_mask]]
                 current_mask[nodes_to_mask] = True
                 node_masks[mask_level] = current_mask
 
-            # Propagate mask to finer levels (children inherit parent's mask)
+            # a child node is masked if any of its points has a masked parent
             for level in range(mask_level + 1, self.num_levels):
-                child_scale = level_scales[level]
-                parent_scale = level_scales[level - 1]
-                scale_ratio = parent_scale // child_scale  # Should be 2
-
-                # For each child node, find its parent
-                # Parent grid = child grid // 2
-                child_grid = []
-                for code in level_unique_nodes[level]:
-                    # Decode Morton code back to xyz (simplified)
-                    # This is approximate but works for our purpose
-                    pass
-
-                # Simpler approach: use point-to-node mapping
-                # A child node is masked if any of its points' parent node is masked
                 parent_point_to_node = level_point_to_node[level - 1]
                 child_point_to_node = level_point_to_node[level]
                 parent_mask = node_masks[level - 1]
 
-                # For each point, check if its parent node is masked
                 point_parent_masked = parent_mask[parent_point_to_node]
 
-                # For each child node, check if all its points have masked parents
                 child_mask = node_masks[level].copy()
                 num_child_nodes = len(level_unique_nodes[level])
 
                 for child_idx in range(num_child_nodes):
                     point_indices = np.where(child_point_to_node == child_idx)[0]
                     if len(point_indices) > 0:
-                        # Child is masked if ANY of its points has masked parent
                         if point_parent_masked[point_indices].any():
                             child_mask[child_idx] = True
 
                 node_masks[level] = child_mask
 
-        # Compute point-level mask from finest level
         finest_mask = node_masks[finest_level]
         point_to_node_finest = level_point_to_node[finest_level]
         points_masked = finest_mask[point_to_node_finest]
 
-        """# Debug: collect after masking info and print all at once
-        debug_lines.append(f"[DEBUG] After masking:")
-        for level in range(self.num_levels):
-            total = len(level_unique_nodes[level])
-            masked = node_masks[level].sum()
-            remaining = total - masked
-            pct = 100 * remaining / total if total > 0 else 0
-            node_size = 0.02 * level_scales[level]
-            debug_lines.append(f"  Level {level}: {remaining}/{total} nodes remaining ({pct:.1f}%) (node_size={node_size:.2f}m)")
-
-        points_remaining = (~points_masked).sum()
-        debug_lines.append(f"[DEBUG] Points: {points_remaining}/{N} remaining ({100*points_remaining/N:.1f}%)")
-
-        # Print all at once (atomic)
-        print("\n".join(debug_lines) + "\n")
-        """
-
-        # Keep only unmasked points
         keep_indices = np.where(~points_masked)[0]
 
         if len(keep_indices) == 0:
-            # Edge case: all points masked, keep at least some
             keep_indices = np.arange(min(self.min_unmasked, N))
 
-        # Apply index selection to all relevant keys
         data_dict = index_operator(data_dict, keep_indices)
 
         return data_dict
@@ -1723,40 +1638,17 @@ class OctreeMaskPoints(object):
 
 @TRANSFORMS.register_module()
 class OctreeTopologyAugmentation(object):
-    """
-    Topology-preserving augmentation for octree-based models.
+    """Random cube-symmetry (axis permutation + flip) applied to grid_coord.
 
-    Applies cube symmetry transformations (rotations and reflections) to grid_coord,
-    which effectively permutes the octant ordering in the resulting octree while
-    preserving the topology (parent-child relationships and sibling occupancy patterns).
-
-    The cube symmetry group has 48 elements:
-    - 24 proper rotations (orientation-preserving)
-    - 24 improper rotations (rotations + reflection)
-
-    Each transformation remaps octant IDs consistently throughout the tree.
-    For example, a 90° rotation around Z maps:
-    - octant 0 (0,0,0) → octant 2 (0,1,0)
-    - octant 1 (1,0,0) → octant 0 (0,0,0)
-    - etc.
-
-    This transform should be applied AFTER GridSample (which provides grid_coord).
-
-    Example config:
-        dict(type="OctreeTopologyAugmentation",
-             transforms="all",  # or "rotations", "reflections", "identity"
-             prob=0.5)
+    Apply after GridSample. transforms: "all" (48 symmetries), "identity",
+    "rotations_z", "reflections", "axis_flips", or a list of
+    (permutation, signs) tuples.
     """
 
-    # All 48 cube symmetry transformations
-    # Each is (permutation, signs) where:
-    # - permutation: which axis to take for (new_x, new_y, new_z)
-    # - signs: whether to flip each axis (1 = no flip, -1 = flip)
     CUBE_SYMMETRIES = []
 
     @staticmethod
     def _generate_cube_symmetries():
-        """Generate all 48 symmetry operations of the cube."""
         if OctreeTopologyAugmentation.CUBE_SYMMETRIES:
             return OctreeTopologyAugmentation.CUBE_SYMMETRIES
 
@@ -1764,44 +1656,39 @@ class OctreeTopologyAugmentation(object):
 
         symmetries = []
 
-        # All axis permutations: 6 options
         for perm in permutations([0, 1, 2]):
-            # All sign combinations: 8 options
             for signs in product([1, -1], repeat=3):
-                # Check if this is a valid rotation/reflection
-                # (determinant should be +1 for rotation, -1 for reflection)
-                # All 48 combinations are valid cube symmetries
                 symmetries.append((perm, signs))
 
         OctreeTopologyAugmentation.CUBE_SYMMETRIES = symmetries
         return symmetries
 
-    # Pre-defined subsets of transformations
+    # (permutation, signs); None falls back to all 48 symmetries
     TRANSFORM_SUBSETS = {
         "identity": [(((0, 1, 2), (1, 1, 1)))],
         "rotations_z": [
-            ((0, 1, 2), (1, 1, 1)),    # 0°
-            ((1, 0, 2), (-1, 1, 1)),   # 90° CCW
-            ((0, 1, 2), (-1, -1, 1)),  # 180°
-            ((1, 0, 2), (1, -1, 1)),   # 270° CCW
+            ((0, 1, 2), (1, 1, 1)),
+            ((1, 0, 2), (-1, 1, 1)),
+            ((0, 1, 2), (-1, -1, 1)),
+            ((1, 0, 2), (1, -1, 1)),
         ],
-        "rotations_90": None,  # Will be computed
+        "rotations_90": None,
         "reflections": [
-            ((0, 1, 2), (-1, 1, 1)),   # Reflect X
-            ((0, 1, 2), (1, -1, 1)),   # Reflect Y
-            ((0, 1, 2), (1, 1, -1)),   # Reflect Z
+            ((0, 1, 2), (-1, 1, 1)),
+            ((0, 1, 2), (1, -1, 1)),
+            ((0, 1, 2), (1, 1, -1)),
         ],
         "axis_flips": [
-            ((0, 1, 2), (1, 1, 1)),    # Identity
-            ((0, 1, 2), (-1, 1, 1)),   # Flip X
-            ((0, 1, 2), (1, -1, 1)),   # Flip Y
-            ((0, 1, 2), (1, 1, -1)),   # Flip Z
-            ((0, 1, 2), (-1, -1, 1)),  # Flip XY
-            ((0, 1, 2), (-1, 1, -1)),  # Flip XZ
-            ((0, 1, 2), (1, -1, -1)),  # Flip YZ
-            ((0, 1, 2), (-1, -1, -1)), # Flip XYZ
+            ((0, 1, 2), (1, 1, 1)),
+            ((0, 1, 2), (-1, 1, 1)),
+            ((0, 1, 2), (1, -1, 1)),
+            ((0, 1, 2), (1, 1, -1)),
+            ((0, 1, 2), (-1, -1, 1)),
+            ((0, 1, 2), (-1, 1, -1)),
+            ((0, 1, 2), (1, -1, -1)),
+            ((0, 1, 2), (-1, -1, -1)),
         ],
-        "all": None,  # Will use full CUBE_SYMMETRIES
+        "all": None,
     }
 
     def __init__(
@@ -1811,24 +1698,10 @@ class OctreeTopologyAugmentation(object):
         apply_to_coord=True,
         apply_to_normal=True,
     ):
-        """
-        Args:
-            transforms: Which transformations to use. Options:
-                - "all": All 48 cube symmetries
-                - "identity": No transformation (useful for ablation)
-                - "rotations_z": 4 rotations around Z axis (0°, 90°, 180°, 270°)
-                - "reflections": 3 axis reflections
-                - "axis_flips": 8 combinations of axis flips
-                - List of (permutation, signs) tuples for custom transforms
-            prob: Probability of applying augmentation (0-1)
-            apply_to_coord: Also transform the continuous coordinates
-            apply_to_normal: Also transform surface normals
-        """
         self.prob = prob
         self.apply_to_coord = apply_to_coord
         self.apply_to_normal = apply_to_normal
 
-        # Get the list of transformations to use
         if isinstance(transforms, str):
             if transforms == "all":
                 self.transforms = self._generate_cube_symmetries()
@@ -1837,53 +1710,23 @@ class OctreeTopologyAugmentation(object):
             else:
                 raise ValueError(f"Unknown transform set: {transforms}")
         else:
-            # Custom list of transforms
             self.transforms = transforms
 
-        # Ensure transforms is not None
         if self.transforms is None:
             self.transforms = self._generate_cube_symmetries()
 
     def _apply_transform(self, coords, perm, signs, max_coords):
-        """
-        Apply a cube symmetry transformation to coordinates.
-
-        Args:
-            coords: [N, 3] coordinates (can be grid_coord or continuous coord)
-            perm: (p0, p1, p2) - axis permutation
-            signs: (s0, s1, s2) - axis signs (+1 or -1)
-            max_coords: [3] max coordinate values for flipping
-
-        Returns:
-            [N, 3] transformed coordinates
-        """
-        # Permute axes
         new_coords = coords[:, perm].copy()
 
-        # Apply flips (for negative sign, flip around center)
         for i in range(3):
             if signs[i] < 0:
-                # Flip: new = max - old
                 new_coords[:, i] = max_coords[perm[i]] - new_coords[:, i]
 
         return new_coords
 
     def _apply_transform_to_vectors(self, vectors, perm, signs):
-        """
-        Apply transformation to vectors (like normals) - no translation needed.
-
-        Args:
-            vectors: [N, 3] vectors
-            perm: axis permutation
-            signs: axis signs
-
-        Returns:
-            [N, 3] transformed vectors
-        """
-        # Permute axes
         new_vectors = vectors[:, perm].copy()
 
-        # Apply sign flips
         for i in range(3):
             if signs[i] < 0:
                 new_vectors[:, i] = -new_vectors[:, i]
@@ -1891,29 +1734,23 @@ class OctreeTopologyAugmentation(object):
         return new_vectors
 
     def __call__(self, data_dict):
-        # Check probability
         if random.random() > self.prob:
             return data_dict
 
-        # Need grid_coord for octree topology transformation
         if "grid_coord" not in data_dict:
             return data_dict
 
-        # Randomly select a transformation
         transform_idx = random.randint(0, len(self.transforms) - 1)
         perm, signs = self.transforms[transform_idx]
 
         grid_coord = data_dict["grid_coord"]
 
-        # Compute max coordinates for flipping
         grid_max = grid_coord.max(axis=0)
 
-        # Transform grid_coord
         data_dict["grid_coord"] = self._apply_transform(
             grid_coord, perm, signs, grid_max
         )
 
-        # Optionally transform continuous coordinates
         if self.apply_to_coord and "coord" in data_dict:
             coord = data_dict["coord"]
             coord_max = coord.max(axis=0)
@@ -1921,13 +1758,11 @@ class OctreeTopologyAugmentation(object):
                 coord, perm, signs, coord_max
             )
 
-        # Optionally transform normals
         if self.apply_to_normal and "normal" in data_dict:
             data_dict["normal"] = self._apply_transform_to_vectors(
                 data_dict["normal"], perm, signs
             )
 
-        # Store which transform was applied (for debugging/analysis)
         data_dict["topology_transform"] = (perm, signs)
 
         return data_dict

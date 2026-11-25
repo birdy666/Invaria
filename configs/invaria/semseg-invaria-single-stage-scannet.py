@@ -19,7 +19,7 @@ model = dict(
     loss_weights=[0.3, 0.6, 1.0],
     eval_pass="adaptive",
     backbone=dict(
-        type="Invaria-v3",
+        type="Invaria",
         in_channels=6,
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
@@ -164,6 +164,7 @@ data = dict(
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(type="NormalizeColor"),
+            # dict(type="RandomScale", scale=[0.5, 0.5]),
         ],
         test_mode=True,
         test_cfg=dict(
@@ -176,6 +177,11 @@ data = dict(
             ),
             crop=None,
             post_transform=[
+                # dict(
+                #     type="RandomDropout",
+                #     dropout_ratio=0.95,
+                #     dropout_application_ratio=1.0,
+                # ),
                 dict(type="CenterShift", apply_z=False),
                 dict(type="ToTensor"),
                 dict(
