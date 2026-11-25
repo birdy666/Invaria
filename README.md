@@ -70,10 +70,10 @@ The project is built partially based on [Pointcept](https://github.com/Pointcept
 
 If you find this project useful, please cite:
 ```
-@article{chang2026invaria,
+@inproceedings{chang2026invaria,
   title={Invaria: Learning Scale and Density Invariance in Point Clouds via Next-Resolution Prediction},
   author={Chang, Chun-Peng and Wang, Shaoxiang and Pagani, Alain and Gavrila, Dariu and Caesar, Holger},
-  journal={arXiv preprint arXiv:2605.15923},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
   year={2026}
 }
 ```
